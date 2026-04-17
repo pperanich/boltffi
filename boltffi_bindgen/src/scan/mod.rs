@@ -64,38 +64,35 @@ pub struct TypeMeta {
 /// parameters and synthesize a concrete `#[data]`-shaped record in the
 /// IR without ever emitting the generic form itself.
 #[derive(Clone)]
-pub struct GenericStructTemplate {
-    pub type_params: Vec<String>,
-    pub fields: Vec<GenericTemplateField>,
-    pub is_repr_c: bool,
-    pub is_error: bool,
-    pub doc: Option<String>,
+struct GenericStructTemplate {
+    type_params: Vec<String>,
+    fields: Vec<GenericTemplateField>,
+    is_repr_c: bool,
+    is_error: bool,
+    doc: Option<String>,
 }
 
 #[derive(Clone)]
-pub struct GenericTemplateField {
-    pub name: String,
-    pub ty: syn::Type,
-    pub doc: Option<String>,
-    pub default: Option<String>,
+struct GenericTemplateField {
+    name: String,
+    ty: syn::Type,
+    doc: Option<String>,
+    default: Option<String>,
 }
 
 /// A use-site like `Request<MyEffect>` the scanner has seen but not yet
 /// materialized into a concrete record. Keyed by mangled name in
 /// `SourceScanner::pending_generic_instantiations`.
 #[derive(Clone)]
-pub struct PendingInstantiation {
-    pub base: String,
-    pub args: Vec<syn::Type>,
+struct PendingInstantiation {
+    base: String,
+    args: Vec<syn::Type>,
 }
 
 type GenericTemplates = HashMap<String, GenericStructTemplate>;
 type PendingGenericInstantiations = RefCell<IndexMap<String, PendingInstantiation>>;
 
-/// Read-only bundle of everything `rust_type_to_ffi_type` needs to do
-/// its job. Kept as a struct so that future additions (new lookup
-/// tables, diagnostic channels, etc.) do not force changes at every
-/// call site.
+/// Read-only bundle of everything `rust_type_to_ffi_type` needs.
 struct ResolveCtx<'a> {
     registry: &'a TypeRegistry,
     alias_resolver: &'a AliasResolver,
@@ -525,13 +522,19 @@ impl std::fmt::Display for ScanDiagnostic {
     }
 }
 
-fn rust_type_spelling(ty: &syn::Type) -> String {
-    let s = quote::quote!(#ty).to_string();
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn struct_has_type_params(item_struct: &ItemStruct) -> bool {
     item_struct.generics.type_params().next().is_some()
+}
+
+fn struct_is_repr_c(item_struct: &ItemStruct) -> bool {
+    let has_data = has_attribute(&item_struct.attrs, "data");
+    let is_error = has_attribute(&item_struct.attrs, "error");
+    let has_any_repr = item_struct.attrs.iter().any(|a| a.path().is_ident("repr"));
+    if (has_data || is_error) && !has_any_repr {
+        true
+    } else {
+        has_repr_c(&item_struct.attrs)
+    }
 }
 
 fn mangle_generic_instance(base: &str, args: &[syn::Type]) -> String {
@@ -635,8 +638,27 @@ impl SourceScanner {
     fn record_unresolved(&self, context: impl Into<String>, ty: &syn::Type) {
         self.scan_errors.borrow_mut().push(ScanDiagnostic {
             context: context.into(),
-            rust_type: rust_type_spelling(ty),
+            rust_type: normalize_type(ty),
         });
+    }
+
+    /// Resolve a `syn::Type` through `rust_type_to_ffi_type` and, on
+    /// failure, record a diagnostic at `context` so the offending
+    /// symbol is never silently dropped. `context` is built lazily via
+    /// `FnOnce` so the common success path pays no format cost.
+    fn resolve_or_record(
+        &self,
+        ty: &syn::Type,
+        self_type_name: Option<&str>,
+        context: impl FnOnce() -> String,
+    ) -> Option<MType> {
+        match rust_type_to_ffi_type(ty, &self.resolve_ctx(&self.alias_resolver, self_type_name)) {
+            Some(t) => Some(t),
+            None => {
+                self.record_unresolved(context(), ty);
+                None
+            }
+        }
     }
 
     pub fn take_scan_errors(&self) -> Vec<ScanDiagnostic> {
@@ -659,24 +681,21 @@ impl SourceScanner {
     }
 
     /// Materialize every pending `Request<MyEffect>`-style use-site the
-    /// scanner observed. Iterates to a fixed point because expanding one
-    /// template's fields may itself reference another generic template.
-    pub fn finalize_generic_instantiations(&mut self) {
+    /// scanner observed. Iterates to a fixed point because expanding
+    /// one template's fields may itself reference another generic
+    /// template, which queues a new pending entry.
+    pub(crate) fn finalize_generic_instantiations(&mut self) {
         const MAX_ITERATIONS: usize = 32;
         for _ in 0..MAX_ITERATIONS {
-            let pending: Vec<(String, PendingInstantiation)> = self
-                .pending_generic_instantiations
-                .borrow_mut()
-                .iter()
-                .filter(|(mangled, _)| !self.type_registry.contains(mangled))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-
+            let pending: IndexMap<String, PendingInstantiation> =
+                std::mem::take(&mut self.pending_generic_instantiations.borrow_mut());
             if pending.is_empty() {
-                break;
+                return;
             }
-
             for (mangled, pending) in pending {
+                if self.type_registry.contains(&mangled) {
+                    continue;
+                }
                 self.materialize_generic_instance(&mangled, &pending);
             }
         }
@@ -684,9 +703,6 @@ impl SourceScanner {
 
     fn materialize_generic_instance(&mut self, mangled: &str, pending: &PendingInstantiation) {
         let Some(template) = self.generic_templates.get(&pending.base).cloned() else {
-            // Base template disappeared — should not happen, but a clean
-            // no-op lets the surrounding diagnostic machinery point at
-            // the original use-site error instead.
             return;
         };
         if template.type_params.len() != pending.args.len() {
@@ -726,22 +742,12 @@ impl SourceScanner {
             .iter()
             .filter_map(|field| {
                 let substituted = substitute_type_params(&field.ty, &subs);
-                let field_type = match rust_type_to_ffi_type(
-                    &substituted,
-                    &self.resolve_ctx(&self.alias_resolver, None),
-                ) {
-                    Some(t) => t,
-                    None => {
-                        self.record_unresolved(
-                            format!(
-                                "generic instantiation `{}` field `{}`",
-                                mangled, field.name
-                            ),
-                            &substituted,
-                        );
-                        return None;
-                    }
-                };
+                let field_type = self.resolve_or_record(&substituted, None, || {
+                    format!(
+                        "generic instantiation `{mangled}` field `{}`",
+                        field.name
+                    )
+                })?;
                 let mut record_field = RecordField::new(&field.name, field_type);
                 if let Some(doc) = &field.doc {
                     record_field = record_field.with_doc(doc.clone());
@@ -800,22 +806,13 @@ impl SourceScanner {
             Fields::Unit => Vec::new(),
         };
 
-        let has_data = has_attribute(&item_struct.attrs, "data");
-        let is_error = has_attribute(&item_struct.attrs, "error");
-        let has_any_repr = item_struct.attrs.iter().any(|a| a.path().is_ident("repr"));
-        let is_repr_c = if (has_data || is_error) && !has_any_repr {
-            true
-        } else {
-            has_repr_c(&item_struct.attrs)
-        };
-
         self.generic_templates.insert(
             name,
             GenericStructTemplate {
                 type_params,
                 fields,
-                is_repr_c,
-                is_error,
+                is_repr_c: struct_is_repr_c(item_struct),
+                is_error: has_attribute(&item_struct.attrs, "error"),
                 doc: extract_doc_string(&item_struct.attrs),
             },
         );
@@ -1311,10 +1308,6 @@ impl SourceScanner {
                             && has_ffi_type_derive(&item_struct.attrs)) =>
                 {
                     if struct_has_type_params(item_struct) {
-                        // Generic user struct — store as a monomorphization
-                        // template and skip the normal Pending registration
-                        // so downstream `process_record` does not try to
-                        // resolve `T` as a concrete type.
                         self.register_generic_template(item_struct);
                         continue;
                     }
@@ -1392,20 +1385,15 @@ impl SourceScanner {
                     self.type_registry
                         .set_doc(&item_struct.ident.to_string(), doc);
                 }
-                if has_attribute(&item_struct.attrs, "ffi_record")
+                if (has_attribute(&item_struct.attrs, "ffi_record")
                     || has_attribute(&item_struct.attrs, "data")
                     || has_attribute(&item_struct.attrs, "error")
                     || has_repr_c(&item_struct.attrs)
                     || (has_attribute(&item_struct.attrs, "derive")
-                        && has_ffi_type_derive(&item_struct.attrs))
+                        && has_ffi_type_derive(&item_struct.attrs)))
+                    && !struct_has_type_params(item_struct)
                 {
-                    if struct_has_type_params(item_struct) {
-                        // Generic templates were captured during
-                        // `collect_type_names`; concrete monomorphizations
-                        // are synthesized from use-sites later.
-                    } else {
-                        self.process_record(item_struct);
-                    }
+                    self.process_record(item_struct);
                 }
             }
             Item::Impl(item_impl) => {
@@ -1464,19 +1452,10 @@ impl SourceScanner {
                     syn::Pat::Ident(ident) => ident.ident.to_string(),
                     _ => return None,
                 };
-                match rust_type_to_ffi_type(
-                    &pat_type.ty,
-                    &self.resolve_ctx(&self.alias_resolver, self_type),
-                ) {
-                    Some(ty) => Some((name, ty)),
-                    None => {
-                        self.record_unresolved(
-                            format!("{context} parameter `{name}`"),
-                            &pat_type.ty,
-                        );
-                        None
-                    }
-                }
+                self.resolve_or_record(&pat_type.ty, self_type, || {
+                    format!("{context} parameter `{name}`")
+                })
+                .map(|ty| (name, ty))
             })
             .collect();
 
@@ -1492,16 +1471,7 @@ impl SourceScanner {
         match output {
             syn::ReturnType::Default => None,
             syn::ReturnType::Type(_, ty) => {
-                match rust_type_to_ffi_type(
-                    ty,
-                    &self.resolve_ctx(&self.alias_resolver, self_type),
-                ) {
-                    Some(mty) => Some(mty),
-                    None => {
-                        self.record_unresolved(format!("{context} return"), ty);
-                        None
-                    }
-                }
+                self.resolve_or_record(ty, self_type, || format!("{context} return"))
             }
         }
     }
@@ -1528,19 +1498,9 @@ impl SourceScanner {
                 .iter()
                 .filter_map(|f| {
                     let field_name = f.ident.as_ref()?.to_string();
-                    let field_type = match rust_type_to_ffi_type(
-                        &f.ty,
-                        &self.resolve_ctx(&self.alias_resolver, None),
-                    ) {
-                        Some(t) => t,
-                        None => {
-                            self.record_unresolved(
-                                format!("record `{}` field `{}`", name, field_name),
-                                &f.ty,
-                            );
-                            return None;
-                        }
-                    };
+                    let field_type = self.resolve_or_record(&f.ty, None, || {
+                        format!("record `{name}` field `{field_name}`")
+                    })?;
                     let mut record_field = RecordField::new(&field_name, field_type);
                     if let Some(doc) = extract_doc_string(&f.attrs) {
                         record_field = record_field.with_doc(doc);
@@ -1554,16 +1514,12 @@ impl SourceScanner {
             _ => Vec::new(),
         };
 
-        let has_data = has_attribute(&item_struct.attrs, "data");
-        let is_error = has_attribute(&item_struct.attrs, "error");
-        let has_any_repr = item_struct.attrs.iter().any(|a| a.path().is_ident("repr"));
-        let is_repr_c = if (has_data || is_error) && !has_any_repr {
-            true
-        } else {
-            has_repr_c(&item_struct.attrs)
-        };
-        self.type_registry
-            .fill_record_fields(&name, fields, is_repr_c, is_error);
+        self.type_registry.fill_record_fields(
+            &name,
+            fields,
+            struct_is_repr_c(item_struct),
+            has_attribute(&item_struct.attrs, "error"),
+        );
     }
 
     fn process_enum(
@@ -1609,22 +1565,11 @@ impl SourceScanner {
                         .iter()
                         .filter_map(|f| {
                             let field_name = f.ident.as_ref()?.to_string();
-                            let field_type = match rust_type_to_ffi_type(
-                                &f.ty,
-                                &self.resolve_ctx(&self.alias_resolver, None),
-                            ) {
-                                Some(t) => t,
-                                None => {
-                                    self.record_unresolved(
-                                        format!(
-                                            "enum `{}` variant `{}` field `{}`",
-                                            name, variant_name, field_name
-                                        ),
-                                        &f.ty,
-                                    );
-                                    return None;
-                                }
-                            };
+                            let field_type = self.resolve_or_record(&f.ty, None, || {
+                                format!(
+                                    "enum `{name}` variant `{variant_name}` field `{field_name}`"
+                                )
+                            })?;
                             let mut record_field = RecordField::new(&field_name, field_type);
                             if let Some(doc) = extract_doc_string(&f.attrs) {
                                 record_field = record_field.with_doc(doc);
@@ -1637,22 +1582,11 @@ impl SourceScanner {
                         .iter()
                         .enumerate()
                         .filter_map(|(i, f)| {
-                            let field_type = match rust_type_to_ffi_type(
-                                &f.ty,
-                                &self.resolve_ctx(&self.alias_resolver, None),
-                            ) {
-                                Some(t) => t,
-                                None => {
-                                    self.record_unresolved(
-                                        format!(
-                                            "enum `{}` variant `{}` field `{}`",
-                                            name, variant_name, i
-                                        ),
-                                        &f.ty,
-                                    );
-                                    return None;
-                                }
-                            };
+                            let field_type = self.resolve_or_record(&f.ty, None, || {
+                                format!(
+                                    "enum `{name}` variant `{variant_name}` field `{i}`"
+                                )
+                            })?;
                             Some(RecordField::new(format!("value_{i}"), field_type))
                         })
                         .collect(),
@@ -2828,13 +2762,8 @@ fn rust_type_to_ffi_type(ty: &Type, ctx: &ResolveCtx<'_>) -> Option<MType> {
                 return None;
             }
 
-            // User-defined generic struct use-site:
-            // `Request<MyEffect>` where `Request<T>` was recorded as a
-            // generic template during `collect_type_names`. The concrete
-            // record with substituted fields is materialized later in a
-            // finalization pass; here we just note the pending instance
-            // and return a `Record` reference to the mangled name.
-            if ctx.generic_templates.contains_key(&ident)
+            if !ctx.generic_templates.is_empty()
+                && ctx.generic_templates.contains_key(&ident)
                 && let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments
             {
                 let concrete_args: Vec<syn::Type> = args
