@@ -274,6 +274,20 @@ pub(crate) fn generate_java_header(
             })?;
 
     let contract = ir::build_contract(&mut module);
+    if let Err(errors) = ir::validate_contract(&contract) {
+        let report = errors
+            .iter()
+            .map(|e| format!("  - {e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(CliError::CommandFailed {
+            command: format!(
+                "validate_contract: {} error(s)\n{report}",
+                errors.len()
+            ),
+            status: None,
+        });
+    }
     let abi = ir::Lowerer::new(&contract).to_abi_contract();
     let header_code = CHeaderLowerer::new(&contract, &abi).generate();
     std::fs::write(&output_path, header_code).map_err(|source| CliError::WriteFailed {

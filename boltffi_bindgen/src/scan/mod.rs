@@ -1,6 +1,7 @@
 use boltffi_ffi_rules::naming;
 use indexmap::IndexMap;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -448,6 +449,34 @@ pub struct SourceScanner {
     integer_constants: HashMap<String, i128>,
     source_root: Option<PathBuf>,
     target_pointer_width_bits: Option<u8>,
+    scan_errors: RefCell<Vec<ScanDiagnostic>>,
+}
+
+/// A type the scanner could not resolve, together with where it appeared.
+///
+/// Emitted by `SourceScanner` any time a method, function, field, or variant
+/// would have been silently dropped because `rust_type_to_ffi_type` returned
+/// `None`. Collected so the scanner can fail hard rather than emit phantom
+/// bindings that look valid but omit the offending symbol.
+#[derive(Debug, Clone)]
+pub struct ScanDiagnostic {
+    pub context: String,
+    pub rust_type: String,
+}
+
+impl std::fmt::Display for ScanDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unresolved type `{}` at {} (not a primitive, String, Vec<u8>, user `#[boltffi::data]` type, or supported container; generic user types like `Request<T>` are not yet supported)",
+            self.rust_type, self.context
+        )
+    }
+}
+
+fn rust_type_spelling(ty: &syn::Type) -> String {
+    let s = quote::quote!(#ty).to_string();
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl SourceScanner {
@@ -470,7 +499,19 @@ impl SourceScanner {
             integer_constants: HashMap::new(),
             source_root: None,
             target_pointer_width_bits,
+            scan_errors: RefCell::new(Vec::new()),
         }
+    }
+
+    fn record_unresolved(&self, context: impl Into<String>, ty: &syn::Type) {
+        self.scan_errors.borrow_mut().push(ScanDiagnostic {
+            context: context.into(),
+            rust_type: rust_type_spelling(ty),
+        });
+    }
+
+    pub fn take_scan_errors(&self) -> Vec<ScanDiagnostic> {
+        std::mem::take(&mut self.scan_errors.borrow_mut())
     }
 
     pub fn scan_directory(&mut self, crate_path: &Path, dir: &Path) -> Result<(), String> {
@@ -1091,6 +1132,7 @@ impl SourceScanner {
         &self,
         inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
         self_type: Option<&str>,
+        context: &str,
     ) -> Option<Vec<(String, MType)>> {
         let typed: Vec<_> = inputs
             .iter()
@@ -1107,30 +1149,51 @@ impl SourceScanner {
                     syn::Pat::Ident(ident) => ident.ident.to_string(),
                     _ => return None,
                 };
-                let ty = rust_type_to_ffi_type(
+                match rust_type_to_ffi_type(
                     &pat_type.ty,
                     &self.type_registry,
                     &self.alias_resolver,
                     &self.compiler_canonical_types,
                     self_type,
-                )?;
-                Some((name, ty))
+                ) {
+                    Some(ty) => Some((name, ty)),
+                    None => {
+                        self.record_unresolved(
+                            format!("{context} parameter `{name}`"),
+                            &pat_type.ty,
+                        );
+                        None
+                    }
+                }
             })
             .collect();
 
         (resolved.len() == typed.len()).then_some(resolved)
     }
 
-    fn resolve_output(&self, output: &syn::ReturnType, self_type: Option<&str>) -> Option<MType> {
+    fn resolve_output(
+        &self,
+        output: &syn::ReturnType,
+        self_type: Option<&str>,
+        context: &str,
+    ) -> Option<MType> {
         match output {
             syn::ReturnType::Default => None,
-            syn::ReturnType::Type(_, ty) => rust_type_to_ffi_type(
-                ty,
-                &self.type_registry,
-                &self.alias_resolver,
-                &self.compiler_canonical_types,
-                self_type,
-            ),
+            syn::ReturnType::Type(_, ty) => {
+                match rust_type_to_ffi_type(
+                    ty,
+                    &self.type_registry,
+                    &self.alias_resolver,
+                    &self.compiler_canonical_types,
+                    self_type,
+                ) {
+                    Some(mty) => Some(mty),
+                    None => {
+                        self.record_unresolved(format!("{context} return"), ty);
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -1156,13 +1219,22 @@ impl SourceScanner {
                 .iter()
                 .filter_map(|f| {
                     let field_name = f.ident.as_ref()?.to_string();
-                    let field_type = rust_type_to_ffi_type(
+                    let field_type = match rust_type_to_ffi_type(
                         &f.ty,
                         &self.type_registry,
                         &self.alias_resolver,
                         &self.compiler_canonical_types,
                         None,
-                    )?;
+                    ) {
+                        Some(t) => t,
+                        None => {
+                            self.record_unresolved(
+                                format!("record `{}` field `{}`", name, field_name),
+                                &f.ty,
+                            );
+                            return None;
+                        }
+                    };
                     let mut record_field = RecordField::new(&field_name, field_type);
                     if let Some(doc) = extract_doc_string(&f.attrs) {
                         record_field = record_field.with_doc(doc);
@@ -1231,13 +1303,25 @@ impl SourceScanner {
                         .iter()
                         .filter_map(|f| {
                             let field_name = f.ident.as_ref()?.to_string();
-                            let field_type = rust_type_to_ffi_type(
+                            let field_type = match rust_type_to_ffi_type(
                                 &f.ty,
                                 &self.type_registry,
                                 &self.alias_resolver,
                                 &self.compiler_canonical_types,
                                 None,
-                            )?;
+                            ) {
+                                Some(t) => t,
+                                None => {
+                                    self.record_unresolved(
+                                        format!(
+                                            "enum `{}` variant `{}` field `{}`",
+                                            name, variant_name, field_name
+                                        ),
+                                        &f.ty,
+                                    );
+                                    return None;
+                                }
+                            };
                             let mut record_field = RecordField::new(&field_name, field_type);
                             if let Some(doc) = extract_doc_string(&f.attrs) {
                                 record_field = record_field.with_doc(doc);
@@ -1250,13 +1334,25 @@ impl SourceScanner {
                         .iter()
                         .enumerate()
                         .filter_map(|(i, f)| {
-                            let field_type = rust_type_to_ffi_type(
+                            let field_type = match rust_type_to_ffi_type(
                                 &f.ty,
                                 &self.type_registry,
                                 &self.alias_resolver,
                                 &self.compiler_canonical_types,
                                 None,
-                            )?;
+                            ) {
+                                Some(t) => t,
+                                None => {
+                                    self.record_unresolved(
+                                        format!(
+                                            "enum `{}` variant `{}` field `{}`",
+                                            name, variant_name, i
+                                        ),
+                                        &f.ty,
+                                    );
+                                    return None;
+                                }
+                            };
                             Some(RecordField::new(format!("value_{i}"), field_type))
                         })
                         .collect(),
@@ -1287,10 +1383,11 @@ impl SourceScanner {
 
     fn process_function(&mut self, item_fn: &syn::ItemFn) {
         let sig = &item_fn.sig;
-        let Some(params) = self.resolve_typed_params(&sig.inputs, None) else {
+        let ctx = format!("function `{}`", sig.ident);
+        let Some(params) = self.resolve_typed_params(&sig.inputs, None, &ctx) else {
             return;
         };
-        let output = self.resolve_output(&sig.output, None);
+        let output = self.resolve_output(&sig.output, None, &ctx);
         if matches!(sig.output, syn::ReturnType::Type(..)) && output.is_none() {
             return;
         }
@@ -1314,7 +1411,7 @@ impl SourceScanner {
             .items
             .iter()
             .filter_map(|item| match item {
-                syn::TraitItem::Fn(method) => self.build_trait_method(method),
+                syn::TraitItem::Fn(method) => self.build_trait_method(method, &name),
                 _ => None,
             })
             .fold(CallbackTrait::new(&name), |ct, m| ct.with_method(m))
@@ -1324,10 +1421,15 @@ impl SourceScanner {
         self.callback_traits.push(callback);
     }
 
-    fn build_trait_method(&self, method: &syn::TraitItemFn) -> Option<TraitMethod> {
+    fn build_trait_method(
+        &self,
+        method: &syn::TraitItemFn,
+        trait_name: &str,
+    ) -> Option<TraitMethod> {
         let sig = &method.sig;
-        let params = self.resolve_typed_params(&sig.inputs, None)?;
-        let output = self.resolve_output(&sig.output, None);
+        let ctx = format!("callback trait method `{}::{}`", trait_name, sig.ident);
+        let params = self.resolve_typed_params(&sig.inputs, None, &ctx)?;
+        let output = self.resolve_output(&sig.output, None, &ctx);
 
         Some(
             params
@@ -1438,8 +1540,9 @@ impl SourceScanner {
     fn build_method(&self, method: &syn::ImplItemFn, self_type_name: &str) -> Option<Method> {
         let sig = &method.sig;
         let receiver = Self::extract_receiver(sig);
-        let params = self.resolve_typed_params(&sig.inputs, Some(self_type_name))?;
-        let output = self.resolve_output(&sig.output, Some(self_type_name));
+        let ctx = format!("method `{}::{}`", self_type_name, sig.ident);
+        let params = self.resolve_typed_params(&sig.inputs, Some(self_type_name), &ctx)?;
+        let output = self.resolve_output(&sig.output, Some(self_type_name), &ctx);
 
         Some(
             params
@@ -1505,7 +1608,8 @@ impl SourceScanner {
             syn::ReturnType::Default => false,
             syn::ReturnType::Type(_, ty) => return_type_is_option_self(ty.as_ref(), self_type_name),
         };
-        let params = self.resolve_typed_params(&sig.inputs, Some(self_type_name))?;
+        let ctx = format!("constructor `{}::{}`", self_type_name, sig.ident);
+        let params = self.resolve_typed_params(&sig.inputs, Some(self_type_name), &ctx)?;
 
         Some(
             params
@@ -2741,6 +2845,19 @@ pub fn scan_crate_with_pointer_width(
         target_pointer_width_bits.or_else(parse_target_pointer_width),
     );
     scanner.scan_directory(crate_path, &src_path)?;
+    let diagnostics = scanner.take_scan_errors();
+    if !diagnostics.is_empty() {
+        let report = diagnostics
+            .iter()
+            .map(|d| format!("  - {d}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "boltffi: {} unresolved type(s) encountered during scan — these would have been silently dropped from the generated bindings:\n{}",
+            diagnostics.len(),
+            report
+        ));
+    }
     let module = scanner.into_module();
     validate_no_symbol_collisions(&module)?;
     Ok(module)
@@ -3607,5 +3724,95 @@ mod tests {
             .push(Record::new("Point").with_method(Method::new("distance", Receiver::Ref)));
 
         assert!(validate_no_symbol_collisions(&module).is_ok());
+    }
+
+    fn scan_temp_crate_result(source: &str) -> Result<Module, String> {
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!(
+            "boltffi_scan_diag_{}_{}",
+            std::process::id(),
+            unique_suffix
+        ));
+        let src_dir = temp_root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("lib.rs"), source).expect("write lib.rs");
+        let result = scan_crate_with_pointer_width(&temp_root, "testlib", None);
+        fs::remove_dir_all(&temp_root).ok();
+        result
+    }
+
+    #[test]
+    fn unresolved_generic_user_type_in_return_is_hard_error() {
+        // `Request<MyEffect>` is a user-defined generic wrapper the scanner
+        // does not understand today (only Vec/Option/Result/Arc/Box handled).
+        // This previously silently dropped the whole function from the
+        // generated binding. The scanner must now fail with a diagnostic
+        // naming the offending type and context.
+        let source = r#"
+            use boltffi::*;
+
+            #[data]
+            pub enum MyEffect { A, B }
+
+            pub struct Request<T> { pub id: u32, pub effect: T }
+
+            #[export]
+            pub fn dispatch() -> Vec<Request<MyEffect>> {
+                Vec::new()
+            }
+        "#;
+
+        let err = scan_temp_crate_result(source).expect_err("scan should fail");
+        assert!(
+            err.contains("unresolved type"),
+            "error should call out unresolved type: {err}"
+        );
+        assert!(
+            err.contains("Request"),
+            "error should name the offending type: {err}"
+        );
+        assert!(
+            err.contains("dispatch"),
+            "error should name the containing function: {err}"
+        );
+    }
+
+    #[test]
+    fn unresolved_user_type_in_param_is_hard_error() {
+        // A `#[export]` impl method taking a type the scanner cannot resolve
+        // must fail instead of silently disappearing from the binding.
+        let source = r#"
+            use boltffi::*;
+
+            pub struct OpaqueThing;
+
+            pub struct Core;
+
+            #[export]
+            impl Core {
+                pub fn new() -> Self { Core }
+
+                pub fn consume(&self, thing: OpaqueThing) {
+                    let _ = thing;
+                }
+            }
+        "#;
+
+        let err = scan_temp_crate_result(source).expect_err("scan should fail");
+        assert!(
+            err.contains("unresolved type"),
+            "error should call out unresolved type: {err}"
+        );
+        assert!(
+            err.contains("OpaqueThing"),
+            "error should name the offending type: {err}"
+        );
+        assert!(
+            err.contains("consume"),
+            "error should name the containing method: {err}"
+        );
     }
 }

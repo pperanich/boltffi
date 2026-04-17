@@ -142,6 +142,20 @@ impl<'a> GenerateRequest<'a> {
         })?;
 
         let ffi_contract = ir::build_contract(&mut scanned_module);
+        if let Err(errors) = ir::validate_contract(&ffi_contract) {
+            let report = errors
+                .iter()
+                .map(|e| format!("  - {e:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(CliError::CommandFailed {
+                command: format!(
+                    "validate_contract: {} error(s)\n{report}",
+                    errors.len()
+                ),
+                status: None,
+            });
+        }
         let abi_contract = ir::Lowerer::new(&ffi_contract).to_abi_contract();
 
         Ok(LoweredCrate {
