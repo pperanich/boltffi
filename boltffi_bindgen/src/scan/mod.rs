@@ -92,7 +92,10 @@ struct PendingInstantiation {
 type GenericTemplates = HashMap<String, GenericStructTemplate>;
 type PendingGenericInstantiations = RefCell<IndexMap<String, PendingInstantiation>>;
 
-/// Read-only bundle of everything `rust_type_to_ffi_type` needs.
+/// Read-only bundle of everything `rust_type_to_ffi_type` needs. The
+/// `scan_errors` handle is shared so the resolver can record
+/// diagnostics at use-sites (e.g. arity mismatch on a generic
+/// template) without needing a `&mut` on the scanner.
 struct ResolveCtx<'a> {
     registry: &'a TypeRegistry,
     alias_resolver: &'a AliasResolver,
@@ -100,8 +103,8 @@ struct ResolveCtx<'a> {
     self_type_name: Option<&'a str>,
     generic_templates: &'a GenericTemplates,
     pending_instantiations: &'a PendingGenericInstantiations,
+    scan_errors: &'a RefCell<Vec<ScanDiagnostic>>,
 }
-
 
 #[derive(Default)]
 pub struct TypeRegistry {
@@ -516,7 +519,7 @@ impl std::fmt::Display for ScanDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unresolved type `{}` at {} (not a primitive, String, Vec<u8>, user `#[boltffi::data]` type, or supported container; generic user types like `Request<T>` are not yet supported)",
+            "unresolved type `{}` at {}",
             self.rust_type, self.context
         )
     }
@@ -530,38 +533,75 @@ fn struct_is_repr_c(item_struct: &ItemStruct) -> bool {
     let has_data = has_attribute(&item_struct.attrs, "data");
     let is_error = has_attribute(&item_struct.attrs, "error");
     let has_any_repr = item_struct.attrs.iter().any(|a| a.path().is_ident("repr"));
-    if (has_data || is_error) && !has_any_repr {
-        true
-    } else {
-        has_repr_c(&item_struct.attrs)
-    }
+    ((has_data || is_error) && !has_any_repr) || has_repr_c(&item_struct.attrs)
 }
 
+/// Mangled identifier for a concrete monomorphization of a generic
+/// user type. Uses `_Of_` / `_And_` separators so that `Foo<A, B>` and
+/// `Foo<AB>`, or `Foo<Vec<u8>>` and `Foo<Vecu8>`, do not collide.
+///
+/// Collision is still possible if a user type literally contains
+/// `_Of_` / `_And_` as substrings; that is rare enough to live with
+/// and diagnosable after the fact via a duplicate-record check.
 fn mangle_generic_instance(base: &str, args: &[syn::Type]) -> String {
     let mut out = String::from(base);
-    for arg in args {
-        out.push_str(&mangle_type_for_name(arg));
+    for (i, arg) in args.iter().enumerate() {
+        out.push_str(if i == 0 { "_Of_" } else { "_And_" });
+        mangle_type_into(&mut out, arg);
     }
     out
 }
 
-fn mangle_type_for_name(ty: &syn::Type) -> String {
-    let spelling = quote::quote!(#ty).to_string();
-    spelling
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect()
+fn mangle_type_into(out: &mut String, ty: &syn::Type) {
+    match ty {
+        syn::Type::Path(type_path) => {
+            for (i, seg) in type_path.path.segments.iter().enumerate() {
+                if i > 0 {
+                    out.push('_');
+                }
+                out.push_str(&seg.ident.to_string());
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for (j, arg) in args.args.iter().enumerate() {
+                        if let syn::GenericArgument::Type(inner) = arg {
+                            out.push_str(if j == 0 { "_Of_" } else { "_And_" });
+                            mangle_type_into(out, inner);
+                        }
+                    }
+                }
+            }
+        }
+        syn::Type::Tuple(tuple) => {
+            out.push_str("Tuple");
+            for (i, elem) in tuple.elems.iter().enumerate() {
+                out.push_str(if i == 0 { "_Of_" } else { "_And_" });
+                mangle_type_into(out, elem);
+            }
+            if tuple.elems.is_empty() {
+                out.push_str("_Unit");
+            }
+        }
+        syn::Type::Reference(r) => mangle_type_into(out, &r.elem),
+        syn::Type::Paren(p) => mangle_type_into(out, &p.elem),
+        syn::Type::Slice(s) => {
+            out.push_str("Slice_Of_");
+            mangle_type_into(out, &s.elem);
+        }
+        syn::Type::Array(a) => {
+            out.push_str("Array_Of_");
+            mangle_type_into(out, &a.elem);
+        }
+        other => {
+            let spelling = quote::quote!(#other).to_string();
+            out.extend(spelling.chars().filter(|c| c.is_alphanumeric() || *c == '_'));
+        }
+    }
 }
 
 /// Replace references to generic type parameters inside `ty` with the
-/// concrete types from `subs`.
-///
-/// Only walks the AST shapes the scanner itself handles
-/// (`Type::Path`, `Type::Reference`, `Type::Slice`, `Type::Tuple`).
-/// Other shapes are returned unchanged; `rust_type_to_ffi_type` will then
-/// fail to resolve them and record a diagnostic, which is the right
-/// behavior — users asking for unsupported generic substitutions need a
-/// clear error, not silent breakage.
+/// concrete types from `subs`. Unhandled shapes (`BareFn`, raw pointer,
+/// `ImplTrait`, etc.) are cloned verbatim; if they contain a type
+/// parameter that did not get substituted, downstream resolution will
+/// fail and record a diagnostic rather than silently mis-resolving.
 fn substitute_type_params(ty: &syn::Type, subs: &HashMap<String, syn::Type>) -> syn::Type {
     match ty {
         syn::Type::Path(type_path) => {
@@ -596,6 +636,11 @@ fn substitute_type_params(ty: &syn::Type, subs: &HashMap<String, syn::Type>) -> 
             *new_slice.elem = substitute_type_params(&slice.elem, subs);
             syn::Type::Slice(new_slice)
         }
+        syn::Type::Array(array) => {
+            let mut new_array = array.clone();
+            *new_array.elem = substitute_type_params(&array.elem, subs);
+            syn::Type::Array(new_array)
+        }
         syn::Type::Tuple(tuple) => {
             let mut new_tuple = tuple.clone();
             new_tuple.elems = tuple
@@ -604,6 +649,16 @@ fn substitute_type_params(ty: &syn::Type, subs: &HashMap<String, syn::Type>) -> 
                 .map(|t| substitute_type_params(t, subs))
                 .collect();
             syn::Type::Tuple(new_tuple)
+        }
+        syn::Type::Paren(paren) => {
+            let mut new_paren = paren.clone();
+            *new_paren.elem = substitute_type_params(&paren.elem, subs);
+            syn::Type::Paren(new_paren)
+        }
+        syn::Type::Group(group) => {
+            let mut new_group = group.clone();
+            *new_group.elem = substitute_type_params(&group.elem, subs);
+            syn::Type::Group(new_group)
         }
         other => other.clone(),
     }
@@ -642,6 +697,18 @@ impl SourceScanner {
         });
     }
 
+    /// Emit a scan diagnostic whose `rust_type` slot is a pre-formatted
+    /// string rather than derived from a `syn::Type`. Use for
+    /// well-formed-but-semantically-invalid situations (e.g. arity
+    /// mismatch on a generic template) where there is no single
+    /// offending syn node to point at.
+    fn record_diagnostic(&self, context: impl Into<String>, rust_type: impl Into<String>) {
+        self.scan_errors.borrow_mut().push(ScanDiagnostic {
+            context: context.into(),
+            rust_type: rust_type.into(),
+        });
+    }
+
     /// Resolve a `syn::Type` through `rust_type_to_ffi_type` and, on
     /// failure, record a diagnostic at `context` so the offending
     /// symbol is never silently dropped. `context` is built lazily via
@@ -677,6 +744,7 @@ impl SourceScanner {
             self_type_name,
             generic_templates: &self.generic_templates,
             pending_instantiations: &self.pending_generic_instantiations,
+            scan_errors: &self.scan_errors,
         }
     }
 
@@ -699,25 +767,37 @@ impl SourceScanner {
                 self.materialize_generic_instance(&mangled, &pending);
             }
         }
+
+        // Ran out of iterations with work still queued — suggests a
+        // cycle or exploding depth. Fail loudly rather than dropping
+        // the remaining pending entries.
+        let leftover: IndexMap<String, PendingInstantiation> =
+            std::mem::take(&mut self.pending_generic_instantiations.borrow_mut());
+        if !leftover.is_empty() {
+            let names: Vec<_> = leftover.keys().cloned().collect();
+            self.record_diagnostic(
+                format!(
+                    "generic monomorphization did not converge after {MAX_ITERATIONS} iterations; pending: {}",
+                    names.join(", ")
+                ),
+                "<pending generic instantiations>".to_string(),
+            );
+        }
     }
 
     fn materialize_generic_instance(&mut self, mangled: &str, pending: &PendingInstantiation) {
         let Some(template) = self.generic_templates.get(&pending.base).cloned() else {
             return;
         };
-        if template.type_params.len() != pending.args.len() {
-            self.scan_errors.borrow_mut().push(ScanDiagnostic {
-                context: format!(
-                    "generic instantiation `{}` (template `{}` expects {} type parameter(s), got {})",
-                    mangled,
-                    pending.base,
-                    template.type_params.len(),
-                    pending.args.len()
-                ),
-                rust_type: format!("{}<...>", pending.base),
-            });
-            return;
-        }
+
+        // Arity was already validated at the use-site
+        // (`rust_type_to_ffi_type`) so this is an internal invariant by
+        // the time we get here.
+        debug_assert_eq!(
+            template.type_params.len(),
+            pending.args.len(),
+            "template arity mismatch should have been caught at the use-site",
+        );
 
         let subs: HashMap<String, syn::Type> = template
             .type_params
@@ -774,9 +854,6 @@ impl SourceScanner {
             .type_params()
             .map(|tp| tp.ident.to_string())
             .collect();
-        if type_params.is_empty() {
-            return;
-        }
 
         let fields: Vec<GenericTemplateField> = match &item_struct.fields {
             Fields::Named(named) => named
@@ -2763,7 +2840,7 @@ fn rust_type_to_ffi_type(ty: &Type, ctx: &ResolveCtx<'_>) -> Option<MType> {
             }
 
             if !ctx.generic_templates.is_empty()
-                && ctx.generic_templates.contains_key(&ident)
+                && let Some(template) = ctx.generic_templates.get(&ident)
                 && let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments
             {
                 let concrete_args: Vec<syn::Type> = args
@@ -2775,6 +2852,18 @@ fn rust_type_to_ffi_type(ty: &Type, ctx: &ResolveCtx<'_>) -> Option<MType> {
                     })
                     .collect();
                 if !concrete_args.is_empty() {
+                    if template.type_params.len() != concrete_args.len() {
+                        ctx.scan_errors.borrow_mut().push(ScanDiagnostic {
+                            context: format!(
+                                "generic use-site of `{}` (expects {} type parameter(s), got {})",
+                                ident,
+                                template.type_params.len(),
+                                concrete_args.len()
+                            ),
+                            rust_type: format!("{}<...>", ident),
+                        });
+                        return None;
+                    }
                     let mangled = mangle_generic_instance(&ident, &concrete_args);
                     ctx.pending_instantiations
                         .borrow_mut()
@@ -3976,7 +4065,7 @@ mod tests {
     #[test]
     fn generic_data_struct_use_site_produces_monomorphized_record() {
         // `#[boltffi::data] struct Request<T>` plus `fn dispatch() -> Vec<Request<MyEffect>>`
-        // should yield a concrete `RequestMyEffect` record in the module,
+        // should yield a concrete `Request_Of_MyEffect` record in the module,
         // with fields substituted to their concrete types. The generic
         // template itself must not appear in the module.
         let source = r#"
@@ -4000,11 +4089,11 @@ mod tests {
         let module = scan_temp_crate(source);
 
         assert!(
-            module.find_record("RequestMyEffect").is_some(),
+            module.find_record("Request_Of_MyEffect").is_some(),
             "monomorphized record missing; records: {:?}",
             module.records.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
-        let record = module.find_record("RequestMyEffect").unwrap();
+        let record = module.find_record("Request_Of_MyEffect").unwrap();
         let field_names: Vec<&str> = record.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(field_names, vec!["id", "effect"]);
 
@@ -4020,7 +4109,7 @@ mod tests {
             .expect("dispatch function scanned");
         let ret_fmt = format!("{:?}", &func.returns);
         assert!(
-            ret_fmt.contains("RequestMyEffect"),
+            ret_fmt.contains("Request_Of_MyEffect"),
             "return type should reference the monomorphized record, got {ret_fmt}"
         );
     }
@@ -4052,7 +4141,7 @@ mod tests {
         let module = scan_temp_crate(source);
 
         assert!(
-            module.find_record("RequestMyEffect").is_some(),
+            module.find_record("Request_Of_MyEffect").is_some(),
             "monomorphized record missing"
         );
         let func = module
@@ -4063,7 +4152,7 @@ mod tests {
         let param = func.inputs.first().expect("accept has a parameter");
         let param_fmt = format!("{:?}", param);
         assert!(
-            param_fmt.contains("RequestMyEffect"),
+            param_fmt.contains("Request_Of_MyEffect"),
             "parameter should reference the monomorphized record, got {param_fmt}"
         );
     }
@@ -4097,16 +4186,76 @@ mod tests {
         let module = scan_temp_crate(source);
 
         assert!(
-            module.find_record("RequestEventA").is_some(),
-            "RequestEventA missing"
+            module.find_record("Request_Of_EventA").is_some(),
+            "Request_Of_EventA missing"
         );
         assert!(
-            module.find_record("RequestEventB").is_some(),
-            "RequestEventB missing"
+            module.find_record("Request_Of_EventB").is_some(),
+            "Request_Of_EventB missing"
         );
         assert!(
             module.find_record("Request").is_none(),
             "generic template `Request<T>` must not appear directly"
+        );
+    }
+
+    #[test]
+    fn generic_instance_with_nested_container_arg_mangles_distinctly() {
+        // `Request<Vec<u8>>` and (hypothetically) `Request<Vecu8>` must
+        // produce different monomorphized names. With the old no-separator
+        // mangling they both became `RequestVecu8`.
+        let source = r#"
+            use boltffi::*;
+
+            #[data]
+            pub struct Request<T> {
+                pub id: u32,
+                pub effect: T,
+            }
+
+            #[export]
+            pub fn dispatch() -> Request<Vec<u8>> {
+                Request { id: 0, effect: Vec::new() }
+            }
+        "#;
+
+        let module = scan_temp_crate(source);
+        let record_names: Vec<&str> =
+            module.records.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            record_names.iter().any(|n| n.contains("Request") && n.contains("Vec")),
+            "expected Request<Vec<u8>> monomorphization, got {record_names:?}"
+        );
+    }
+
+    #[test]
+    fn generic_arity_mismatch_at_use_site_is_hard_error() {
+        let source = r#"
+            use boltffi::*;
+
+            #[data]
+            pub struct Pair<A, B> {
+                pub a: A,
+                pub b: B,
+            }
+
+            #[data]
+            pub enum Tag { X }
+
+            #[export]
+            pub fn bad() -> Pair<Tag> {
+                unreachable!()
+            }
+        "#;
+
+        let err = scan_temp_crate_result(source).expect_err("scan should fail");
+        assert!(
+            err.contains("Pair"),
+            "error should name the offending template: {err}"
+        );
+        assert!(
+            err.contains("expects 2 type parameter"),
+            "error should mention expected arity: {err}"
         );
     }
 
